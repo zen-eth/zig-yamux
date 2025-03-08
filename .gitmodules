@@ -1,0 +1,3 @@
+[submodule "deps/go-yamux"]
+	path = deps/go-yamux
+	url = https://github.com/libp2p/go-yamux.git
