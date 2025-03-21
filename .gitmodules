@@ -1,3 +1,9 @@
 [submodule "deps/go-yamux"]
 	path = deps/go-yamux
 	url = https://github.com/libp2p/go-yamux.git
+[submodule "deps/nim-libp2p"]
+	path = deps/nim-libp2p
+	url = https://github.com/vacp2p/nim-libp2p.git
+[submodule "deps/yamux"]
+	path = deps/yamux
+	url = https://github.com/hashicorp/yamux.git
