@@ -1,11 +1,15 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Stream = @import("stream.zig").Stream;
+const Conn = @import("conn.zig").AnyConn;
+const Config = @import("Config.zig");
+
+pub const Error = error{};
 
 pub const SendReady = struct {
     hdr: []u8,
     body: ?[]u8 = null,
-    err: std.atomic.Value(?anyerror) = std.atomic.Value(?anyerror).init(null),
+    err: ?Error = null,
 
     notify: struct {
         mutex: std.Thread.Mutex = .{},
@@ -22,7 +26,7 @@ pub const SendReady = struct {
         };
     }
 
-    pub fn waitForResult(self: *SendReady) ?anyerror {
+    pub fn waitForResult(self: *SendReady) ?Error {
         self.notify.mutex.lock();
         defer self.notify.mutex.unlock();
 
@@ -30,11 +34,11 @@ pub const SendReady = struct {
             self.notify.cond.wait(&self.notify.mutex);
         }
 
-        return self.err.load(.Acquire);
+        return self.err;
     }
 
-    pub fn setError(self: *SendReady, error_value: ?anyerror) void {
-        self.err.store(error_value, .Release);
+    pub fn setError(self: *SendReady, error_value: ?Error) void {
+        self.err = error_value;
 
         self.notify.mutex.lock();
         defer self.notify.mutex.unlock();
@@ -55,16 +59,16 @@ pub const Session = struct {
 
     // nextStreamID is the next stream we should send.
     // This depends if we are a client/server.
-    next_stream_id: std.atomic.Atomic(u32),
+    next_stream_id: std.atomic.Value(u32),
 
     // config holds our configuration
-    // config: *Config,
+    config: *Config,
 
     // conn is the underlying connection
-    conn: std.io.Reader,
+    conn: Conn,
 
     // bufRead is a buffered reader
-    buf_read: std.io.BufferedReader(4096, std.io.Reader),
+    buf_read: std.io.AnyReader,
 
     // pings is used to track inflight pings
     pings: std.AutoHashMap(u32, *PingNotification),
@@ -116,40 +120,6 @@ pub const Session = struct {
     shutdown_err_lock: std.Thread.Mutex = .{},
 
     allocator: Allocator,
-
-    pub fn init(allocator: Allocator, config: *Config, conn: std.io.Reader, is_client: bool) !*Session {
-        var session = try allocator.create(Session);
-
-        session.* = .{
-            .next_stream_id = std.atomic.Atomic(u32).init(if (is_client) 1 else 2),
-            .config = config,
-            .logger = config.logger orelse Logger.init(config.log_output),
-            .conn = conn,
-            .buf_read = std.io.bufferedReader(conn),
-            .pings = std.AutoHashMap(u32, *PingNotification).init(allocator),
-            .streams = std.AutoHashMap(u32, *Stream).init(allocator),
-            .inflight = std.AutoHashMap(u32, void).init(allocator),
-            .syn_semaphore = Semaphore.init(config.accept_backlog),
-            .accept_queue = std.fifo.LinearFifo(*Stream, .Dynamic).init(allocator),
-            .send_queue = std.fifo.LinearFifo(*SendReady, .Dynamic).init(allocator),
-            .allocator = allocator,
-        };
-
-        try session.accept_queue.ensureTotalCapacity(config.accept_backlog);
-        try session.send_queue.ensureTotalCapacity(64);
-
-        // Start background processing
-        try std.Thread.spawn(.{}, recv, .{session});
-        try std.Thread.spawn(.{}, send, .{session});
-
-        if (config.enable_keep_alive) {
-            try std.Thread.spawn(.{}, keepalive, .{session});
-        }
-
-        return session;
-    }
-
-    // Additional methods would follow...
 };
 
 const PingNotification = struct {
@@ -157,43 +127,3 @@ const PingNotification = struct {
     cond: std.Thread.Condition = .{},
     done: bool = false,
 };
-
-const Semaphore = struct {
-    count: std.atomic.Atomic(usize),
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
-
-    pub fn init(initial: usize) Semaphore {
-        return .{
-            .count = std.atomic.Atomic(usize).init(initial),
-        };
-    }
-
-    pub fn acquire(self: *Semaphore) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        while (self.count.load(.Acquire) == 0) {
-            self.cond.wait(&self.mutex);
-        }
-
-        _ = self.count.fetchSub(1, .Release);
-    }
-
-    pub fn release(self: *Semaphore) void {
-        _ = self.count.fetchAdd(1, .Release);
-        self.cond.signal();
-    }
-};
-
-fn recv(session: *Session) !void {
-    // Implementation would go here...
-}
-
-fn send(session: *Session) !void {
-    // Implementation would go here...
-}
-
-fn keepalive(session: *Session) !void {
-    // Implementation would go here...
-}
