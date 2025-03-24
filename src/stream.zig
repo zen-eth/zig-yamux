@@ -63,7 +63,7 @@ pub const Stream = struct {
     write_deadline: std.atomic.Value(i64),
 
     // For establishment notification
-    establish: struct {
+    establish_notify: struct {
         mutex: std.Thread.Mutex,
         cond: std.Thread.Condition,
         signaled: bool,
@@ -72,8 +72,10 @@ pub const Stream = struct {
     // Set with state_mutex held to honor the StreamCloseTimeout
     close_timer: ?std.time.Timer = null,
 
-    pub fn init(s: *session.Session, id: u32, state: StreamState, stream: *Stream) void {
-        var control_hdr = [_]u8{0} ** frame.Header.SIZE;
+    allocator: std.mem.Allocator,
+
+    pub fn init(s: *session.Session, id: u32, state: StreamState, stream: *Stream, alloc: std.mem.Allocator) void {
+        const control_hdr = [_]u8{0} ** frame.Header.SIZE;
         var send_hdr = [_]u8{0} ** frame.Header.SIZE;
         stream.* = .{
             .id = id,
@@ -107,6 +109,7 @@ pub const Stream = struct {
             },
             .read_deadline = std.atomic.Value(i64).init(0),
             .write_deadline = std.atomic.Value(i64).init(0),
+            .allocator = alloc,
         };
     }
 
@@ -162,7 +165,7 @@ pub const Stream = struct {
                         return Error.ReadTimeout;
                     }
 
-                    // Calculate timeout in nanoseconds
+                    // Calculate timeout in seconds
                     const timeout_ns = deadline - now;
 
                     // Wait with timeout
@@ -205,5 +208,74 @@ pub const Stream = struct {
         }
     }
 
-    pub fn sendWindowUpdate(_: *Stream) !void {}
+    /// sendWindowUpdate potentially sends a window update enabling
+    /// further writes to take place. Must be invoked with the lock.
+    pub fn sendWindowUpdate(self: *Stream) !void {
+        self.control_mutex.lock();
+        defer self.control_mutex.unlock();
+
+        // Determine the delta update
+        const max = self.session.config.max_stream_window_size;
+        var buf_len: u32 = 0;
+
+        self.recv_mutex.lock();
+        if (self.recv_buf) |buf| {
+            buf_len = @intCast(buf.readableLength());
+        }
+        const delta = (max - buf_len) - self.recv_window;
+
+        // Determine the flags if any
+        const flags = self.sendFlags();
+
+        // Check if we can omit the update
+        if (delta < (max / 2) and flags == 0) {
+            self.recv_mutex.unlock();
+            return;
+        }
+
+        // Update our window
+        self.recv_window += delta;
+        self.recv_mutex.unlock();
+
+        // Send the header
+        const header = frame.Header.init(.WINDOW_UPDATE, flags, self.id, delta);
+        try header.encode(self.control_hdr);
+
+        if (self.session.waitForSendErr(self.control_hdr, null)) |err| {
+            if (err == Error.SessionShutdown or err == Error.WriteTimeout) {
+                // Message left in ready queue, header re-use is unsafe.
+                // Need to allocate a new header
+                var new_hdr = [_]u8{0} ** frame.Header.SIZE;
+
+                const old_hdr = self.control_hdr;
+                self.control_hdr = &new_hdr;
+                self.session.allocator.free(old_hdr);
+            }
+            return err;
+        }
+
+        return;
+    }
+
+    /// Determines any flags that are appropriate based on the current stream state.
+    /// Must be called with state_mutex held.
+    fn sendFlags(self: *Stream) u16 {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        var flags: u16 = 0;
+
+        switch (self.state) {
+            .init => {
+                flags |= frame.FrameFlags.SYN;
+                self.state = .syn_sent;
+            },
+            .syn_received => {
+                flags |= frame.FrameFlags.ACK;
+                self.state = .established;
+            },
+            else => {},
+        }
+
+        return flags;
+    }
 };
