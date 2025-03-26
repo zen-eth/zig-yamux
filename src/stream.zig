@@ -74,9 +74,13 @@ pub const Stream = struct {
 
     allocator: std.mem.Allocator,
 
-    pub fn init(s: *session.Session, id: u32, state: StreamState, stream: *Stream, alloc: std.mem.Allocator) void {
-        const control_hdr = [_]u8{0} ** frame.Header.SIZE;
-        var send_hdr = [_]u8{0} ** frame.Header.SIZE;
+    pub fn init(s: *session.Session, id: u32, state: StreamState, stream: *Stream, alloc: std.mem.Allocator) !void {
+        const control_hdr = try alloc.alloc(u8, frame.Header.SIZE);
+        @memset(control_hdr, 0);
+
+        const send_hdr = try alloc.alloc(u8, frame.Header.SIZE);
+        @memset(send_hdr, 0);
+
         stream.* = .{
             .id = id,
             .session = s,
@@ -84,10 +88,10 @@ pub const Stream = struct {
             .state_mutex = .{},
             .recv_buf = null,
             .recv_mutex = .{},
-            .control_hdr = &control_hdr,
+            .control_hdr = control_hdr,
             .control_err = null,
             .control_mutex = .{},
-            .send_hdr = &send_hdr,
+            .send_hdr = send_hdr,
             .send_err = null,
             .send_mutex = .{},
             .recv_window = Config.initial_stream_window,
@@ -102,7 +106,7 @@ pub const Stream = struct {
                 .cond = .{},
                 .signaled = false,
             },
-            .establish = .{
+            .establish_notify = .{
                 .mutex = .{},
                 .cond = .{},
                 .signaled = false,
@@ -111,6 +115,16 @@ pub const Stream = struct {
             .write_deadline = std.atomic.Value(i64).init(0),
             .allocator = alloc,
         };
+    }
+
+    pub fn deinit(self: *Stream) void {
+        self.allocator.free(self.control_hdr);
+        self.allocator.free(self.send_hdr);
+
+        if (self.recv_buf) |buf| {
+            buf.deinit();
+            self.allocator.destroy(buf);
+        }
     }
 
     /// Reads data from the stream into the provided buffer
@@ -241,7 +255,7 @@ pub const Stream = struct {
         const header = frame.Header.init(.WINDOW_UPDATE, flags, self.id, delta);
         try header.encode(self.control_hdr);
 
-        if (self.session.waitForSendErr(self.control_hdr, null)) |err| {
+        self.session.waitForSend(self.control_hdr, null) catch |err| {
             if (err == Error.SessionShutdown or err == Error.WriteTimeout) {
                 // Message left in ready queue, header re-use is unsafe.
                 // Need to allocate a new header
@@ -252,7 +266,7 @@ pub const Stream = struct {
                 self.session.allocator.free(old_hdr);
             }
             return err;
-        }
+        };
 
         return;
     }

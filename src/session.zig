@@ -3,48 +3,32 @@ const Allocator = std.mem.Allocator;
 const Stream = @import("stream.zig").Stream;
 const Conn = @import("conn.zig").AnyConn;
 const Config = @import("Config.zig");
+const Future = @import("future.zig").Future;
+const Intrusive = @import("mpsc.zig").Intrusive;
 
-pub const Error = error{};
+pub const Error = error{SessionShutdown} || error{Timeout};
+
+const Elem = struct {
+    const Self = @This();
+    next: ?*Self = null,
+};
+
+pub const SendQueue = Intrusive(SendReady);
 
 pub const SendReady = struct {
     hdr: []u8,
-    body: ?[]u8 = null,
-    err: ?Error = null,
+    body: ?[]u8,
+    notification: Future(void),
+    next: ?*Self = null,
 
-    notify: struct {
-        mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
-        done: bool = false,
-    } = .{},
-
-    body_mutex: std.Thread.Mutex = .{}, // Protects body from unsafe reads
+    const Self = @This();
 
     pub fn init(hdr: []u8, body: ?[]u8) SendReady {
         return .{
             .hdr = hdr,
             .body = body,
+            .notification = .{},
         };
-    }
-
-    pub fn waitForResult(self: *SendReady) ?Error {
-        self.notify.mutex.lock();
-        defer self.notify.mutex.unlock();
-
-        while (!self.notify.done) {
-            self.notify.cond.wait(&self.notify.mutex);
-        }
-
-        return self.err;
-    }
-
-    pub fn setError(self: *SendReady, error_value: ?Error) void {
-        self.err = error_value;
-
-        self.notify.mutex.lock();
-        defer self.notify.mutex.unlock();
-
-        self.notify.done = true;
-        self.notify.cond.signal();
     }
 };
 
@@ -93,7 +77,7 @@ pub const Session = struct {
 
     // send_queue is used to mark a stream as ready to send,
     // or to send a header out directly.
-    send_queue: std.fifo.LinearFifo(*SendReady, .Dynamic),
+    send_queue: SendQueue,
 
     // recv_done and send_done are used to coordinate shutdown
     recv_done: struct {
@@ -108,18 +92,25 @@ pub const Session = struct {
         done: bool = false,
     } = .{},
 
-    // shutdown is used to safely close a session
-    shutdown: bool = false,
-    shutdown_err: ?anyerror = null,
-    shutdown_notify: struct {
-        mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
-        done: bool = false,
-    } = .{},
-    shutdown_lock: std.Thread.Mutex = .{},
-    shutdown_err_lock: std.Thread.Mutex = .{},
+    shutdown_notification: Future(bool),
 
     allocator: Allocator,
+
+    pub fn waitForSend(self: *Session, hdr: []u8, body: ?[]u8) !void {
+        var send_ready = try self.allocator.create(SendReady);
+        send_ready.* = SendReady.init(hdr, body);
+        self.send_queue.push(send_ready);
+
+        while (!send_ready.notification.isDone() and !self.shutdown_notification.isDone()) {
+            std.time.sleep(10 * std.time.ms_per_s);
+        }
+
+        if (self.shutdown_notification.isDone()) {
+            return Error.SessionShutdown;
+        }
+
+        self.allocator.destroy(send_ready);
+    }
 };
 
 const PingNotification = struct {
