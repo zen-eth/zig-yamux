@@ -15,6 +15,9 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    // get the "zig-aio" dependency from "build.zig.zon"
+    const zig_aio = b.dependency("aio", .{});
+
     const lib = b.addStaticLibrary(.{
         .name = "zig-yamux",
         // In this case the main source file is merely a path, however, in more
@@ -23,6 +26,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    lib.root_module.addImport("aio", zig_aio.module("aio"));
+    // for coroutines api
+    lib.root_module.addImport("coro", zig_aio.module("coro"));
 
     // This declares intent for the library to be installed into the standard
     // location when the user invokes the "install" step (the default step when
@@ -35,6 +42,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    exe.root_module.addImport("aio", zig_aio.module("aio"));
+
+    exe.root_module.addImport("coro", zig_aio.module("coro"));
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
@@ -72,6 +83,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    lib_unit_tests.root_module.addImport("aio", zig_aio.module("aio"));
+
+    lib_unit_tests.root_module.addImport("coro", zig_aio.module("coro"));
+
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
     const exe_unit_tests = b.addTest(.{
@@ -79,6 +94,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    exe_unit_tests.root_module.addImport("aio", zig_aio.module("aio"));
+
+    exe_unit_tests.root_module.addImport("coro", zig_aio.module("coro"));
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
