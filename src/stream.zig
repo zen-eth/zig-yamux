@@ -255,7 +255,7 @@ pub const Stream = struct {
         const header = frame.Header.init(.WINDOW_UPDATE, flags, self.id, delta);
         try header.encode(self.control_hdr);
 
-        self.session.waitForSend(self.control_hdr, null) catch |err| {
+        self.session.sendAndWait(self.control_hdr, null) catch |err| {
             if (err == Error.SessionShutdown or err == Error.WriteTimeout) {
                 // Message left in ready queue, header re-use is unsafe.
                 // Need to allocate a new header

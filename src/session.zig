@@ -3,25 +3,18 @@ const Allocator = std.mem.Allocator;
 const Stream = @import("stream.zig").Stream;
 const Conn = @import("conn.zig").AnyConn;
 const Config = @import("Config.zig");
-const Future = @import("future.zig").Future;
-const Intrusive = @import("mpsc.zig").Intrusive;
-const ThreadPool = std.Thread.Pool;
-const Scheduler = @import("coro").Scheduler;
 
-pub const Error = error{ SessionShutdown, ConnectionWriteTimeout };
-
-pub const SendQueue = Intrusive(SendReady);
+pub const Error = error{ SessionShutdown, ConnectionWriteTimeout, OutOfMemory };
+pub const SendQueue = std.SinglyLinkedList(*SendReady);
 
 pub const SendReady = struct {
     hdr: []u8,
     body: ?[]u8,
-    enqueued_completion: std.Thread.ResetEvent,
-    enqueued_barrier: std.Thread.ResetEvent,
+    body_mutex: std.Thread.Mutex,
     sent_completion: std.Thread.ResetEvent,
-    sent_barrier: std.Thread.ResetEvent,
+    free_completion: std.Thread.ResetEvent,
     err_rwlock: std.Thread.RwLock,
     err: ?Error,
-    next: ?*Self,
 
     const Self = @This();
 
@@ -29,42 +22,28 @@ pub const SendReady = struct {
         return .{
             .hdr = hdr,
             .body = body,
-            .enqueued_completion = .{},
-            .enqueued_barrier = .{},
+            .body_mutex = .{},
             .sent_completion = .{},
-            .sent_barrier = .{},
+            .free_completion = .{},
             .err_rwlock = .{},
             .err = null,
-            .next = null,
         };
     }
 
-    pub fn setErr(self: *Self, err: Error) void {
+    pub fn setError(self: *Self, err: Error) void {
         self.err_rwlock.lock();
         defer self.err_rwlock.unlock();
-        self.err = err;
+
+        if (self.err == null) {
+            self.err = err;
+        }
     }
 
     pub fn getErr(self: *Self) ?Error {
         self.err_rwlock.lockShared();
         defer self.err_rwlock.unlockShared();
+
         return self.err;
-    }
-
-    pub fn notifyEnqueuedBarrier(self: *Self) void {
-        self.enqueued_barrier.set();
-    }
-
-    pub fn waitEnqueuedBarrier(self: *Self) void {
-        self.enqueued_barrier.wait();
-    }
-
-    pub fn notifySentBarrier(self: *Self) void {
-        self.sent_barrier.set();
-    }
-
-    pub fn waitSentBarrier(self: *Self) void {
-        self.sent_barrier.wait();
     }
 };
 
@@ -79,7 +58,7 @@ pub const Session = struct {
 
     // nextStreamID is the next stream we should send.
     // This depends if we are a client/server.
-    next_stream_id: std.atomic.Value(u32),
+    next_stream_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     // config holds our configuration
     config: *Config,
@@ -91,7 +70,7 @@ pub const Session = struct {
     buf_read: std.io.AnyReader,
 
     // pings is used to track inflight pings
-    pings: std.AutoHashMap(u32, *PingNotification),
+    pings: std.AutoHashMap(u32, std.Thread.ResetEvent),
     ping_id: u32 = 0,
     ping_mutex: std.Thread.Mutex = .{},
 
@@ -115,6 +94,16 @@ pub const Session = struct {
     // or to send a header out directly.
     send_queue: SendQueue,
 
+    send_queue_sync: struct {
+        mutex: std.Thread.Mutex = .{},
+        not_empty_cond: std.Thread.Condition = .{},
+        not_full_cond: std.Thread.Condition = .{},
+    } = .{},
+
+    send_queue_size: usize = 0,
+
+    send_queue_capacity: usize = 64,
+
     // recv_done and send_done are used to coordinate shutdown
     recv_done: struct {
         mutex: std.Thread.Mutex = .{},
@@ -130,66 +119,120 @@ pub const Session = struct {
 
     shutdown_notification: std.Thread.ResetEvent = .{},
 
-    scheduler: Scheduler,
-
     allocator: Allocator,
 
-    pub fn waitForSend(self: *Session, hdr: []u8, body: ?[]u8) !void {
-        var send_ready = try self.allocator.create(SendReady);
+    pub fn sendAndWait(self: *Session, hdr: []u8, body: ?[]u8) Error!void {
+        const start_time = std.time.nanoTimestamp();
+        const send_ready = try self.allocator.create(SendReady);
         send_ready.* = SendReady.init(hdr, body);
 
-        self.send_queue.push(send_ready);
+        try self.waitEnqueue(send_ready, self.config.connection_write_timeout);
 
-        var wait_shutdown_task = try self.scheduler.spawn(waitSessionShutdown, .{ &self.shutdown_notification, send_ready, self.config.connection_write_timeout }, .{});
-        var enqueue_task = try self.scheduler.spawn(enqueueSend, .{ self, send_ready }, .{});
-
-        send_ready.waitEnqueuedBarrier();
-        if (send_ready.getErr()) |err| {
-            if (!wait_shutdown_task.isComplete()) {
-                wait_shutdown_task.cancel();
-            }
-            if (!enqueue_task.isComplete()) {
-                enqueue_task.cancel();
-            }
-            self.allocator.destroy(send_ready);
-            return err;
-        }
-
-        send_ready.waitSentBarrier();
-        if (send_ready.getErr()) |err| {
-            if (!wait_shutdown_task.isComplete()) {
-                wait_shutdown_task.cancel();
-            }
-            if (!enqueue_task.isComplete()) {
-                enqueue_task.cancel();
-            }
-            self.allocator.destroy(send_ready);
-            return err;
-        }
-
-        self.allocator.destroy(send_ready);
+        const elapsed_time: i128 = std.time.nanoTimestamp() - start_time;
+        try self.waitSent(body, send_ready, self.config.connection_write_timeout - @as(u64, @intCast(elapsed_time)));
     }
 
-    fn waitSessionShutdown(st_completion: *std.Thread.ResetEvent, send_ready: *SendReady, timeout_ns: u64) void {
-        st_completion.timedWait(timeout_ns) catch {
-            send_ready.setErr(Error.ConnectionWriteTimeout);
-            send_ready.notifyEnqueuedBarrier();
-            send_ready.notifySentBarrier();
+    pub fn send(self: *Session, hdr: []u8, body: ?[]u8) Error!void {
+        const send_ready = try self.allocator.create(SendReady);
+        send_ready.* = SendReady.init(hdr, body);
+
+        try self.waitEnqueue(send_ready, self.config.connection_write_timeout);
+    }
+
+    pub fn sendLoop(self: *Session) Error!void {
+        while (true) {
+            self.send_queue_sync.mutex.lock();
+            while (self.send_queue_size == 0) {
+                // Wait for a notification that the queue is not empty
+                self.send_queue_sync.not_empty_cond.wait(&self.send_queue_sync.mutex);
+            }
+            const send_ready = self.send_queue.popFirst().?.data;
+            self.send_queue_size -= 1;
+            self.send_queue_sync.not_full_cond.broadcast();
+            self.send_queue_sync.mutex.unlock();
+
+            // Check if the session is shutting down
+            if (self.shutdown_notification.isSet()) {
+                send_ready.sent_completion.set();
+                send_ready.free_completion.wait();
+                self.allocator.destroy(send_ready);
+                return;
+            }
+
+            send_ready.body_mutex.lock();
+            send_ready.body = null;
+            send_ready.body_mutex.unlock();
+            send_ready.sent_completion.set();
+
+            send_ready.free_completion.wait();
+            self.allocator.destroy(send_ready);
+        }
+    }
+
+    fn waitEnqueue(self: *Session, send_ready: *SendReady, timeout_ns: u64) Error!void {
+        self.send_queue_sync.mutex.lock();
+        while (self.send_queue_size >= self.send_queue_capacity) {
+            self.send_queue_sync.not_full_cond.timedWait(&self.send_queue_sync.mutex, timeout_ns) catch {
+                self.send_queue_sync.mutex.unlock();
+                self.allocator.destroy(send_ready);
+                if (self.shutdown_notification.isSet()) {
+                    return Error.SessionShutdown;
+                }
+                return Error.ConnectionWriteTimeout;
+            };
+            if (self.shutdown_notification.isSet()) {
+                self.send_queue_sync.mutex.unlock();
+                self.allocator.destroy(send_ready);
+                return Error.SessionShutdown;
+            }
+        }
+        const node = try self.allocator.create(SendQueue.Node);
+        node.* = .{ .data = send_ready };
+        self.send_queue.prepend(node);
+        self.send_queue_size += 1;
+        self.send_queue_sync.not_empty_cond.signal();
+        self.send_queue_sync.mutex.unlock();
+    }
+
+    fn waitSent(self: *Session, body: ?[]u8, send_ready: *SendReady, timeout_ns: u64) Error!void {
+        send_ready.sent_completion.timedWait(timeout_ns) catch {
+            copyBody(body, send_ready, self.allocator);
+            send_ready.free_completion.set();
+            if (self.shutdown_notification.isSet()) {
+                return Error.SessionShutdown;
+            }
+            return Error.ConnectionWriteTimeout;
         };
 
-        send_ready.setErr(Error.SessionShutdown);
-        send_ready.notifyEnqueuedBarrier();
-        send_ready.notifySentBarrier();
+        if (self.shutdown_notification.isSet()) {
+            copyBody(body, send_ready, self.allocator);
+            send_ready.free_completion.set();
+            return Error.SessionShutdown;
+        }
+
+        if (send_ready.getErr()) |err| {
+            send_ready.free_completion.set();
+            return err;
+        }
+
+        send_ready.free_completion.set();
     }
 
-    fn enqueueSend(self: *Session, send_ready: *SendReady) void {
-        self.send_queue.push(send_ready);
-        send_ready.notifyEnqueuedBarrier();
-    }
-};
+    fn copyBody(body: ?[]u8, send_ready: *SendReady, allocator: Allocator) void {
+        if (body == null) {
+            return; // A null body is ignored.
+        }
 
-const PingNotification = struct {
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
-    done: bool = false,
+        send_ready.body_mutex.lock();
+        defer send_ready.body_mutex.unlock();
+
+        if (send_ready.body == null) {
+            return; // Body was already copied.
+        }
+
+        const body_len = body.?.len;
+        const new_body = allocator.alloc(u8, body_len) catch unreachable;
+        @memcpy(new_body, body.?);
+        send_ready.body = new_body[0..body_len];
+    }
 };
