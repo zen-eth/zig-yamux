@@ -6,9 +6,10 @@ const AnyConn = conn.AnyConn;
 const Config = @import("Config.zig");
 const testing = std.testing;
 const ThreadPool = std.Thread.Pool;
+const aio = @import("aio");
 
 pub const Error = error{ SessionShutdown, ConnectionWriteTimeout, OutOfMemory };
-pub const SendQueue = std.SinglyLinkedList(*SendReady);
+const SendQueue = std.SinglyLinkedList(*SendReady);
 
 pub const SendReady = struct {
     hdr: []u8,
