@@ -141,6 +141,47 @@ fn stdStreamClose(stream: std.net.Stream) void {
     stream.close();
 }
 
+/// A connection based on pipe file descriptors, useful for testing connection interfaces
+pub const PipeConn = struct {
+    reader_fd: posix.fd_t,
+    writer_fd: posix.fd_t,
+    closed: bool = false,
+
+    const Self = @This();
+
+    pub fn deinit(self: *Self) void {
+        if (!self.closed) {
+            posix.close(self.reader_fd);
+            posix.close(self.writer_fd);
+            self.closed = true;
+        }
+    }
+
+    pub fn read(self: *Self, buffer: []u8) posix.ReadError!usize {
+        return posix.read(self.reader_fd, buffer);
+    }
+
+    pub fn write(self: *Self, buffer: []const u8) posix.WriteError!usize {
+        return posix.write(self.writer_fd, buffer);
+    }
+
+    pub fn close(self: *Self) void {
+        self.deinit();
+    }
+
+    /// Convert to GenericConn interface
+    pub fn conn(self: *Self) GenericConn(
+        *Self,
+        posix.ReadError,
+        posix.WriteError,
+        read,
+        write,
+        close,
+    ) {
+        return .{ .context = self };
+    }
+};
+
 /// Shared structure for thread communication
 const ServerContext = struct {
     socket: posix.socket_t,
@@ -251,4 +292,123 @@ test "GenericConn with std.net.Stream" {
     }
 
     client_stream.close();
+}
+
+/// Creates a pair of connected PipeConn instances
+pub fn createPipeConnPair() !struct { client: PipeConn, server: PipeConn } {
+    const fds1 = try posix.pipe();
+    errdefer {
+        posix.close(fds1[0]);
+        posix.close(fds1[1]);
+    }
+
+    const fds2 = try posix.pipe();
+    errdefer {
+        posix.close(fds2[0]);
+        posix.close(fds2[1]);
+    }
+
+    // First pipe: client reads from fds1[0], server writes to fds1[1]
+    // Second pipe: server reads from fds2[0], client writes to fds2[1]
+    return .{
+        .client = .{
+            .reader_fd = fds1[0],
+            .writer_fd = fds2[1],
+        },
+        .server = .{
+            .reader_fd = fds2[0],
+            .writer_fd = fds1[1],
+        },
+    };
+}
+
+test "PipeConn direct usage" {
+    var pipes = try createPipeConnPair();
+    defer {
+        pipes.client.deinit();
+        pipes.server.deinit();
+    }
+
+    const message = "Hello through pipe!";
+    try testing.expectEqual(message.len, try pipes.client.write(message));
+
+    var buffer: [128]u8 = undefined;
+    const bytes_read = try pipes.server.read(&buffer);
+    try testing.expectEqual(message.len, bytes_read);
+    try testing.expectEqualStrings(message, buffer[0..bytes_read]);
+}
+
+test "PipeConn with GenericConn" {
+    var pipes = try createPipeConnPair();
+    defer {
+        pipes.client.deinit();
+        pipes.server.deinit();
+    }
+
+    var client_conn = pipes.client.conn();
+    var server_conn = pipes.server.conn();
+
+    const message = "Hello GenericConn!";
+    try testing.expectEqual(message.len, try client_conn.write(message));
+
+    var buffer: [128]u8 = undefined;
+    const bytes_read = try server_conn.read(&buffer);
+    try testing.expectEqual(message.len, bytes_read);
+    try testing.expectEqualStrings(message, buffer[0..bytes_read]);
+
+    // Test reader/writer interfaces
+    var client_writer = client_conn.writer();
+    var server_reader = server_conn.reader();
+
+    try client_writer.writeAll("Line test\n");
+
+    var line_buffer: [20]u8 = undefined;
+    const line = try server_reader.readUntilDelimiter(&line_buffer, '\n');
+    try testing.expectEqualStrings("Line test", line);
+}
+
+test "PipeConn with AnyConn" {
+    var pipes = try createPipeConnPair();
+    defer {
+        pipes.client.deinit();
+        pipes.server.deinit();
+    }
+
+    var client_conn = pipes.client.conn();
+    var server_conn = pipes.server.conn();
+
+    var any_client = client_conn.any();
+    var any_server = server_conn.any();
+
+    const message = "AnyConn test";
+    try testing.expectEqual(message.len, try any_client.write(message));
+
+    var buffer: [128]u8 = undefined;
+    const bytes_read = try any_server.read(&buffer);
+    try testing.expectEqual(message.len, bytes_read);
+    try testing.expectEqualStrings(message, buffer[0..bytes_read]);
+}
+
+test "PipeConn bidirectional communication" {
+    var pipes = try createPipeConnPair();
+    defer {
+        pipes.client.deinit();
+        pipes.server.deinit();
+    }
+
+    var client_conn = pipes.client.conn();
+    var server_conn = pipes.server.conn();
+
+    // Client to server
+    _ = try client_conn.write("Hello server");
+
+    var buffer: [128]u8 = undefined;
+    const server_read = try server_conn.read(&buffer);
+    try testing.expectEqualStrings("Hello server", buffer[0..server_read]);
+
+    // Server to client
+    _ = try server_conn.write("Hello client");
+
+    const client_read = try client_conn.read(&buffer);
+    try testing.expectEqualStrings("Hello client", buffer[0..client_read]);
 }
