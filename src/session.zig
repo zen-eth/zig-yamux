@@ -13,15 +13,16 @@ pub const SendQueue = std.SinglyLinkedList(*SendReady);
 pub const SendReady = struct {
     hdr: []u8,
     body: ?[]u8,
-    sent_completion: std.Thread.ResetEvent,
-    free_completion: std.Thread.ResetEvent,
+    timeout_ns: u64,
+    sent_completion: ?std.Thread.ResetEvent,
+    free_completion: ?std.Thread.ResetEvent,
     err_rwlock: std.Thread.RwLock,
     err: ?anyerror,
     allocator: Allocator,
 
     const Self = @This();
 
-    pub fn init(hdr: []u8, body: ?[]u8, allocator: Allocator) !SendReady {
+    pub fn init(hdr: []u8, body: ?[]u8, wait_sent: bool, timeout_ns: u64, allocator: Allocator) !SendReady {
         // Since the body will be reused by the caller, we need to copy it.
         // This is possibly not the best way to do this, but it is the simplest.
         // We could also use a pool of buffers to avoid copying the body later.
@@ -31,13 +32,16 @@ pub const SendReady = struct {
             body_copy = try allocator.dupe(u8, b);
         }
 
+        const sent_completion = if (wait_sent) std.Thread.ResetEvent{} else null;
+        const free_completion = if (wait_sent) std.Thread.ResetEvent{} else null;
         return .{
             .hdr = hdr_copy,
             .body = body_copy,
-            .sent_completion = .{},
-            .free_completion = .{},
+            .sent_completion = sent_completion,
+            .free_completion = free_completion,
             .err_rwlock = .{},
             .err = null,
+            .timeout_ns = timeout_ns,
             .allocator = allocator,
         };
     }
@@ -156,6 +160,10 @@ pub const Session = struct {
             .inflight = std.AutoHashMap(u32, void).init(allocator),
             .scheduler = scheduler,
         };
+    }
+
+    pub fn initAndStart(allocator: Allocator, config: *Config, any_conn: AnyConn, s: *Session, scheduler: *ThreadPool) !void {
+        try init(allocator, config, any_conn, s, scheduler);
 
         try s.scheduler.spawn(sendLoopInThread, .{s});
     }
@@ -168,25 +176,30 @@ pub const Session = struct {
         self.send_queue_sync.mutex.lock();
         while (self.send_queue.popFirst()) |node| {
             const send_ready = node.data;
+            send_ready.deinit();
             self.allocator.destroy(send_ready);
             self.allocator.destroy(node);
         }
+        self.send_queue_sync.mutex.unlock();
     }
 
     pub fn sendAndWait(self: *Session, hdr: []u8, body: ?[]u8) !void {
         const start_time = std.time.nanoTimestamp();
         const send_ready = try self.allocator.create(SendReady);
-        send_ready.* = try SendReady.init(hdr, body, self.allocator);
+        send_ready.* = try SendReady.init(hdr, body, true, self.config.connection_write_timeout, self.allocator);
 
         try self.waitEnqueue(send_ready, self.config.connection_write_timeout);
 
         const elapsed_time: i128 = std.time.nanoTimestamp() - start_time;
+        if (self.config.connection_write_timeout <= elapsed_time) {
+            return error.ConnectionWriteTimeout;
+        }
         try self.waitSent(send_ready, self.config.connection_write_timeout - @as(u64, @intCast(elapsed_time)));
     }
 
     pub fn send(self: *Session, hdr: []u8, body: ?[]u8) Error!void {
         const send_ready = try self.allocator.create(SendReady);
-        send_ready.* = try SendReady.init(hdr, body, self.allocator);
+        send_ready.* = try SendReady.init(hdr, body, false, self.config.connection_write_timeout, self.allocator);
 
         try self.waitEnqueue(send_ready, self.config.connection_write_timeout);
     }
@@ -211,26 +224,35 @@ pub const Session = struct {
             const node = self.send_queue.popFirst().?;
             defer self.allocator.destroy(node);
             const send_ready = node.data;
+            defer {
+                send_ready.deinit();
+                self.allocator.destroy(send_ready);
+            }
             self.send_queue_size -= 1;
             self.send_queue_sync.not_full_cond.broadcast();
             self.send_queue_sync.mutex.unlock();
 
             // Check if the session is shutting down
             if (self.shutdown_notification.isSet()) {
-                send_ready.sent_completion.set();
-                send_ready.free_completion.wait();
-                send_ready.deinit();
-                self.allocator.destroy(send_ready);
+                send_ready.setError(Error.SessionShutdown);
+                if (send_ready.sent_completion) |*sent_completion| {
+                    sent_completion.set();
+                }
+                if (send_ready.free_completion) |*free_completion| {
+                    free_completion.timedWait(send_ready.timeout_ns) catch {};
+                }
                 return;
             }
 
             _ = self.conn.write(send_ready.hdr) catch |err| {
                 std.debug.print("sendLoop: write error: {}\n", .{err});
                 send_ready.setError(err);
-                send_ready.sent_completion.set();
-                send_ready.free_completion.wait();
-                send_ready.deinit();
-                self.allocator.destroy(send_ready);
+                if (send_ready.sent_completion) |*sent_completion| {
+                    sent_completion.set();
+                }
+                if (send_ready.free_completion) |*free_completion| {
+                    free_completion.timedWait(send_ready.timeout_ns) catch {};
+                }
                 return err;
             };
 
@@ -238,18 +260,22 @@ pub const Session = struct {
                 _ = self.conn.write(body) catch |err| {
                     std.debug.print("sendLoop: write error: {}\n", .{err});
                     send_ready.setError(err);
-                    send_ready.sent_completion.set();
-                    send_ready.free_completion.wait();
-                    send_ready.deinit();
-                    self.allocator.destroy(send_ready);
+                    if (send_ready.sent_completion) |*sent_completion| {
+                        sent_completion.set();
+                    }
+                    if (send_ready.free_completion) |*free_completion| {
+                        free_completion.timedWait(send_ready.timeout_ns) catch {};
+                    }
                     return err;
                 };
             }
 
-            send_ready.sent_completion.set();
-            send_ready.free_completion.wait();
-            send_ready.deinit();
-            self.allocator.destroy(send_ready);
+            if (send_ready.sent_completion) |*sent_completion| {
+                sent_completion.set();
+            }
+            if (send_ready.free_completion) |*free_completion| {
+                free_completion.timedWait(send_ready.timeout_ns) catch {};
+            }
         }
     }
 
@@ -266,6 +292,7 @@ pub const Session = struct {
         while (self.send_queue_size >= self.send_queue_capacity) {
             self.send_queue_sync.not_full_cond.timedWait(&self.send_queue_sync.mutex, timeout_ns) catch {
                 self.send_queue_sync.mutex.unlock();
+                send_ready.deinit();
                 self.allocator.destroy(send_ready);
                 if (self.shutdown_notification.isSet()) {
                     return Error.SessionShutdown;
@@ -274,10 +301,18 @@ pub const Session = struct {
             };
             if (self.shutdown_notification.isSet()) {
                 self.send_queue_sync.mutex.unlock();
+                send_ready.deinit();
                 self.allocator.destroy(send_ready);
                 return Error.SessionShutdown;
             }
         }
+        if (self.shutdown_notification.isSet()) {
+            self.send_queue_sync.mutex.unlock();
+            send_ready.deinit();
+            self.allocator.destroy(send_ready);
+            return Error.SessionShutdown;
+        }
+
         const node = try self.allocator.create(SendQueue.Node);
         node.* = .{ .data = send_ready };
         self.send_queue.prepend(node);
@@ -287,8 +322,8 @@ pub const Session = struct {
     }
 
     fn waitSent(self: *Session, send_ready: *SendReady, timeout_ns: u64) !void {
-        send_ready.sent_completion.timedWait(timeout_ns) catch {
-            send_ready.free_completion.set();
+        send_ready.sent_completion.?.timedWait(timeout_ns) catch {
+            send_ready.free_completion.?.set();
             if (self.shutdown_notification.isSet()) {
                 return Error.SessionShutdown;
             }
@@ -296,16 +331,16 @@ pub const Session = struct {
         };
 
         if (self.shutdown_notification.isSet()) {
-            send_ready.free_completion.set();
+            send_ready.free_completion.?.set();
             return Error.SessionShutdown;
         }
 
         if (send_ready.getErr()) |err| {
-            send_ready.free_completion.set();
+            send_ready.free_completion.?.set();
             return err;
         }
 
-        send_ready.free_completion.set();
+        send_ready.free_completion.?.set();
     }
 };
 
@@ -318,10 +353,56 @@ test "Session.send using PipeConn" {
 
     const client_conn = pipes.client.conn().any();
 
-    // Create a basic config for testing
     var config = Config.defaultConfig();
 
-    // Create a session using the client connection
+    var session: Session = undefined;
+    var pool: std.Thread.Pool = undefined;
+    try std.Thread.Pool.init(&pool, .{ .allocator = testing.allocator });
+    defer pool.deinit();
+
+    try Session.initAndStart(testing.allocator, &config, client_conn, &session, &pool);
+    defer session.deinit();
+
+    const hdr = "test header";
+    const bd = "test body content";
+    for (0..3) |_| {
+        const header = try testing.allocator.dupe(u8, hdr);
+        defer testing.allocator.free(header);
+
+        const body = try testing.allocator.dupe(u8, bd);
+        defer testing.allocator.free(body);
+
+        // Send the data
+        try session.sendAndWait(header, body);
+
+        // Give time for sending to complete
+        std.time.sleep(10 * std.time.ns_per_ms);
+    }
+
+    var buffer: [256]u8 = undefined;
+    const bytes_read = try pipes.server.read(&buffer);
+
+    try testing.expect(bytes_read == 84);
+
+    const received_data = buffer[0..bytes_read];
+    try testing.expectEqualSlices(u8, hdr, received_data[0..hdr.len]);
+    try testing.expectEqualSlices(u8, bd, received_data[hdr.len .. hdr.len + 17]);
+
+    session.close();
+}
+
+test "Session.send using PipeConn timeout" {
+    var pipes = try conn.createPipeConnPair();
+    defer {
+        pipes.client.deinit();
+        pipes.server.deinit();
+    }
+
+    const client_conn = pipes.client.conn().any();
+
+    var config = Config.defaultConfig();
+    config.connection_write_timeout = 1000 * std.time.ns_per_ms; // 1 second
+
     var session: Session = undefined;
     var pool: std.Thread.Pool = undefined;
     try std.Thread.Pool.init(&pool, .{ .allocator = testing.allocator });
@@ -330,34 +411,206 @@ test "Session.send using PipeConn" {
     try Session.init(testing.allocator, &config, client_conn, &session, &pool);
     defer session.deinit();
 
-    // Prepare test data
+    // Set the send queue capacity to 1 and make sendAndWait and send both timeout
+    session.send_queue_sync.mutex.lock();
+    session.send_queue_capacity = 1;
+    session.send_queue_sync.mutex.unlock();
+
     const header = try testing.allocator.dupe(u8, "test header");
     defer testing.allocator.free(header);
 
     const body = try testing.allocator.dupe(u8, "test body content");
     defer testing.allocator.free(body);
 
-    // Send the data
-    try session.sendAndWait(header, body);
+    const res = session.sendAndWait(header, body);
+    try testing.expectError(error.ConnectionWriteTimeout, res);
 
-    // Give time for sending to complete
+    const res1 = session.send(header, body);
+    try testing.expectError(error.ConnectionWriteTimeout, res1);
+
+    session.close();
+}
+
+test "Session.send after shutdown" {
+    var pipes = try conn.createPipeConnPair();
+    defer {
+        pipes.client.deinit();
+        pipes.server.deinit();
+    }
+
+    const client_conn = pipes.client.conn().any();
+
+    var config = Config.defaultConfig();
+
+    var session: Session = undefined;
+    var pool: std.Thread.Pool = undefined;
+    try std.Thread.Pool.init(&pool, .{ .allocator = testing.allocator });
+    defer pool.deinit();
+
+    try Session.initAndStart(testing.allocator, &config, client_conn, &session, &pool);
+    defer session.deinit();
+
+    const header = try testing.allocator.dupe(u8, "test header");
+    defer testing.allocator.free(header);
+
+    const body = try testing.allocator.dupe(u8, "test body content");
+    defer testing.allocator.free(body);
+
+    session.close();
+
+    // Give some time for shutdown to propagate
     std.time.sleep(10 * std.time.ns_per_ms);
 
-    // Read from the server side of the pipe
-    var buffer: [256]u8 = undefined;
-    const bytes_read = try pipes.server.read(&buffer);
+    const send_result = session.sendAndWait(header, body);
+    try testing.expectError(error.SessionShutdown, send_result);
 
-    // In a real test, you'd verify the protocol format here
-    // For now, just check that we received some data
-    try testing.expect(bytes_read > 0);
+    const send_result2 = session.send(header, body);
+    try testing.expectError(error.SessionShutdown, send_result2);
+}
 
-    // Check the received data
-    const received_data = buffer[0..bytes_read];
-    try testing.expectEqualSlices(u8, header, received_data[0..header.len]);
-    try testing.expectEqualSlices(u8, body, received_data[header.len..bytes_read]);
+test "Session shutdown during active sendAndWait operations" {
+    var pipes = try conn.createPipeConnPair();
+    defer {
+        pipes.client.deinit();
+        pipes.server.deinit();
+    }
 
-    std.time.sleep(1000 * std.time.ms_per_s);
-    // Signal shutdown to stop the send thread
+    const client_conn = pipes.client.conn().any();
+    var config = Config.defaultConfig();
+
+    var session: Session = undefined;
+    var pool: std.Thread.Pool = undefined;
+    try std.Thread.Pool.init(&pool, .{ .allocator = testing.allocator });
+    defer pool.deinit();
+
+    try Session.initAndStart(testing.allocator, &config, client_conn, &session, &pool);
+    defer session.deinit();
+
+    var shutdown_error_detected = std.atomic.Value(bool).init(false);
+    var should_exit = std.atomic.Value(bool).init(false);
+    var sender_thread: std.Thread = undefined;
+
+    // Start the sender thread that continuously calls sendAndWait
+    sender_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Session, detected: *std.atomic.Value(bool), exit: *std.atomic.Value(bool)) !void {
+            var i: usize = 0;
+            while (!exit.load(.acquire)) {
+                const header = try testing.allocator.alloc(u8, 32);
+                defer testing.allocator.free(header);
+                @memset(header, 'h');
+
+                const body = try testing.allocator.alloc(u8, 64);
+                defer testing.allocator.free(body);
+                @memset(body, 'b');
+
+                s.sendAndWait(header, body) catch |err| {
+                    if (err == error.SessionShutdown) {
+                        detected.store(true, .release);
+                        return;
+                    }
+                    // Ignore timeout errors that might occur from pipe filling up
+                    if (err != error.ConnectionWriteTimeout) {
+                        std.debug.print("Unexpected error: {}\n", .{err});
+                    }
+                };
+
+                i += 1;
+                if (i % 10 == 0) {
+                    // Give other threads a chance to run
+                    std.time.sleep(1 * std.time.ns_per_ms);
+                }
+            }
+        }
+    }.run, .{ &session, &shutdown_error_detected, &should_exit });
+
+    // Wait a bit to allow the sender to get into a rhythm
+    std.time.sleep(50 * std.time.ns_per_ms);
+
     session.close();
-    // try pool.run(.cancel);
+
+    // Give the sender thread time to detect the shutdown and exit
+    var timeout: usize = 0;
+    while (!shutdown_error_detected.load(.acquire) and timeout < 100) {
+        std.time.sleep(10 * std.time.ns_per_ms);
+        timeout += 1;
+    }
+
+    should_exit.store(true, .release);
+    sender_thread.join();
+
+    try testing.expect(shutdown_error_detected.load(.acquire));
+}
+
+test "Session shutdown during active send operations" {
+    var pipes = try conn.createPipeConnPair();
+    defer {
+        pipes.client.deinit();
+        pipes.server.deinit();
+    }
+
+    const client_conn = pipes.client.conn().any();
+    var config = Config.defaultConfig();
+
+    var session: Session = undefined;
+    var pool: std.Thread.Pool = undefined;
+    try std.Thread.Pool.init(&pool, .{ .allocator = testing.allocator });
+    defer pool.deinit();
+
+    try Session.initAndStart(testing.allocator, &config, client_conn, &session, &pool);
+    defer session.deinit();
+
+    // Create shared state between threads
+    var shutdown_error_detected = std.atomic.Value(bool).init(false);
+    var should_exit = std.atomic.Value(bool).init(false);
+    var sender_thread: std.Thread = undefined;
+
+    // Start the sender thread that continuously calls sendAndWait
+    sender_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Session, detected: *std.atomic.Value(bool), exit: *std.atomic.Value(bool)) !void {
+            var i: usize = 0;
+            while (!exit.load(.acquire)) {
+                const header = try testing.allocator.alloc(u8, 32);
+                defer testing.allocator.free(header);
+                @memset(header, 'h');
+
+                const body = try testing.allocator.alloc(u8, 64);
+                defer testing.allocator.free(body);
+                @memset(body, 'b');
+
+                s.send(header, body) catch |err| {
+                    if (err == error.SessionShutdown) {
+                        detected.store(true, .release);
+                        return;
+                    }
+                    // Ignore timeout errors that might occur from pipe filling up
+                    if (err != error.ConnectionWriteTimeout) {
+                        std.debug.print("Unexpected error: {}\n", .{err});
+                    }
+                };
+
+                i += 1;
+                if (i % 10 == 0) {
+                    // Give other threads a chance to run
+                    std.time.sleep(1 * std.time.ns_per_ms);
+                }
+            }
+        }
+    }.run, .{ &session, &shutdown_error_detected, &should_exit });
+
+    // Wait a bit to allow the sender to get into a rhythm
+    std.time.sleep(50 * std.time.ns_per_ms);
+
+    session.close();
+
+    // Give the sender thread time to detect the shutdown and exit
+    var timeout: usize = 0;
+    while (!shutdown_error_detected.load(.acquire) and timeout < 100) {
+        std.time.sleep(10 * std.time.ns_per_ms);
+        timeout += 1;
+    }
+
+    should_exit.store(true, .release);
+    sender_thread.join();
+
+    try testing.expect(shutdown_error_detected.load(.acquire));
 }
