@@ -22,14 +22,6 @@ const SentCompletion = struct {
         if (self.err == null) {
             self.err = err;
         }
-        self.done.set();
-    }
-
-    pub fn setDone(self: *SentCompletion) void {
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
-
-        self.done.set();
     }
 
     pub fn getErr(self: *SentCompletion) ?anyerror {
@@ -43,7 +35,8 @@ const SentCompletion = struct {
 pub const SendReady = struct {
     hdr: []u8,
     body: ?[]u8 = null,
-    sent_completion: std.atomic.Value(?*SentCompletion),
+    rwlock: std.Thread.RwLock = .{},
+    sent_completion: ?*SentCompletion = null,
     allocator: Allocator,
 
     const Self = @This();
@@ -61,7 +54,7 @@ pub const SendReady = struct {
         return .{
             .hdr = hdr_copy,
             .body = body_copy,
-            .sent_completion = std.atomic.Value(?*SentCompletion).init(sent_completion),
+            .sent_completion = sent_completion,
             .allocator = allocator,
         };
     }
@@ -180,9 +173,11 @@ pub const Session = struct {
         self.send_queue_sync.mutex.lock();
         while (self.send_queue.popFirst()) |node| {
             const send_ready = node.data;
-            if (send_ready.sent_completion.load(.acquire)) |sent_completion| {
+            send_ready.rwlock.lock();
+            if (send_ready.sent_completion) |sent_completion| {
                 self.allocator.destroy(sent_completion);
             }
+            send_ready.rwlock.unlock();
             send_ready.deinit();
             self.allocator.destroy(send_ready);
             self.allocator.destroy(node);
@@ -244,33 +239,44 @@ pub const Session = struct {
 
             // Check if the session is shutting down
             if (self.shutdown_notification.isSet()) {
-                if (send_ready.sent_completion.load(.acquire)) |sent_completion| {
+                send_ready.rwlock.lockShared();
+                if (send_ready.sent_completion) |sent_completion| {
                     sent_completion.setError(Error.SessionShutdown);
+                    sent_completion.done.set();
                 }
+                send_ready.rwlock.unlockShared();
                 return;
             }
 
             _ = self.conn.write(send_ready.hdr) catch |err| {
                 std.debug.print("sendLoop: write error: {}\n", .{err});
-                if (send_ready.sent_completion.load(.acquire)) |sent_completion| {
+                send_ready.rwlock.lockShared();
+                if (send_ready.sent_completion) |sent_completion| {
                     sent_completion.setError(err);
+                    sent_completion.done.set();
                 }
+                send_ready.rwlock.unlockShared();
                 return err;
             };
 
             if (send_ready.body) |body| {
                 _ = self.conn.write(body) catch |err| {
                     std.debug.print("sendLoop: write error: {}\n", .{err});
-                    if (send_ready.sent_completion.load(.acquire)) |sent_completion| {
+                    send_ready.rwlock.lockShared();
+                    if (send_ready.sent_completion) |sent_completion| {
                         sent_completion.setError(err);
+                        sent_completion.done.set();
                     }
+                    send_ready.rwlock.unlockShared();
                     return err;
                 };
             }
 
-            if (send_ready.sent_completion.load(.acquire)) |sent_completion| {
-                sent_completion.setDone();
+            send_ready.rwlock.lockShared();
+            if (send_ready.sent_completion) |sent_completion| {
+                sent_completion.done.set();
             }
+            send_ready.rwlock.unlockShared();
         }
     }
 
@@ -317,22 +323,29 @@ pub const Session = struct {
     }
 
     fn waitSent(self: *Session, send_ready: *SendReady, timeout_ns: u64) !void {
-        send_ready.sent_completion.load(.acquire).?.done.timedWait(timeout_ns) catch {
-            send_ready.sent_completion.store(null, .release);
+        send_ready.rwlock.lockShared();
+        send_ready.sent_completion.?.done.timedWait(timeout_ns) catch {
+            send_ready.rwlock.unlockShared();
+            send_ready.rwlock.lock();
+            send_ready.sent_completion = null;
+            send_ready.rwlock.unlock();
 
             if (self.shutdown_notification.isSet()) {
                 return Error.SessionShutdown;
             }
             return Error.ConnectionWriteTimeout;
         };
+        send_ready.rwlock.unlockShared();
 
         if (self.shutdown_notification.isSet()) {
             return Error.SessionShutdown;
         }
 
-        if (send_ready.sent_completion.load(.acquire).?.getErr()) |err| {
+        send_ready.rwlock.lockShared();
+        if (send_ready.sent_completion.?.getErr()) |err| {
             return err;
         }
+        send_ready.rwlock.unlockShared();
     }
 };
 
