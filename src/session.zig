@@ -10,19 +10,45 @@ const ThreadPool = std.Thread.Pool;
 pub const Error = error{ SessionShutdown, ConnectionWriteTimeout, OutOfMemory };
 pub const SendQueue = std.SinglyLinkedList(*SendReady);
 
+const SentCompletion = struct {
+    done: std.Thread.ResetEvent = .{},
+    rwlock: std.Thread.RwLock = .{},
+    err: ?anyerror = null,
+
+    pub fn setError(self: *SentCompletion, err: anyerror) void {
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+
+        if (self.err == null) {
+            self.err = err;
+        }
+        self.done.set();
+    }
+
+    pub fn setDone(self: *SentCompletion) void {
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+
+        self.done.set();
+    }
+
+    pub fn getErr(self: *SentCompletion) ?anyerror {
+        self.rwlock.lockShared();
+        defer self.rwlock.unlockShared();
+
+        return self.err;
+    }
+};
+
 pub const SendReady = struct {
     hdr: []u8,
-    body: ?[]u8,
-    timeout_ns: u64,
-    sent_completion: ?std.Thread.ResetEvent,
-    free_completion: ?std.Thread.ResetEvent,
-    err_rwlock: std.Thread.RwLock,
-    err: ?anyerror,
+    body: ?[]u8 = null,
+    sent_completion: std.atomic.Value(?*SentCompletion),
     allocator: Allocator,
 
     const Self = @This();
 
-    pub fn init(hdr: []u8, body: ?[]u8, wait_sent: bool, timeout_ns: u64, allocator: Allocator) !SendReady {
+    pub fn init(hdr: []u8, body: ?[]u8, sent_completion: ?*SentCompletion, allocator: Allocator) !SendReady {
         // Since the body will be reused by the caller, we need to copy it.
         // This is possibly not the best way to do this, but it is the simplest.
         // We could also use a pool of buffers to avoid copying the body later.
@@ -32,16 +58,10 @@ pub const SendReady = struct {
             body_copy = try allocator.dupe(u8, b);
         }
 
-        const sent_completion = if (wait_sent) std.Thread.ResetEvent{} else null;
-        const free_completion = if (wait_sent) std.Thread.ResetEvent{} else null;
         return .{
             .hdr = hdr_copy,
             .body = body_copy,
-            .sent_completion = sent_completion,
-            .free_completion = free_completion,
-            .err_rwlock = .{},
-            .err = null,
-            .timeout_ns = timeout_ns,
+            .sent_completion = std.atomic.Value(?*SentCompletion).init(sent_completion),
             .allocator = allocator,
         };
     }
@@ -52,22 +72,6 @@ pub const SendReady = struct {
         if (self.body) |body| {
             self.allocator.free(body);
         }
-    }
-
-    pub fn setError(self: *Self, err: anyerror) void {
-        self.err_rwlock.lock();
-        defer self.err_rwlock.unlock();
-
-        if (self.err == null) {
-            self.err = err;
-        }
-    }
-
-    pub fn getErr(self: *Self) ?anyerror {
-        self.err_rwlock.lockShared();
-        defer self.err_rwlock.unlockShared();
-
-        return self.err;
     }
 };
 
@@ -176,6 +180,9 @@ pub const Session = struct {
         self.send_queue_sync.mutex.lock();
         while (self.send_queue.popFirst()) |node| {
             const send_ready = node.data;
+            if (send_ready.sent_completion.load(.acquire)) |sent_completion| {
+                self.allocator.destroy(sent_completion);
+            }
             send_ready.deinit();
             self.allocator.destroy(send_ready);
             self.allocator.destroy(node);
@@ -186,7 +193,10 @@ pub const Session = struct {
     pub fn sendAndWait(self: *Session, hdr: []u8, body: ?[]u8) !void {
         const start_time = std.time.nanoTimestamp();
         const send_ready = try self.allocator.create(SendReady);
-        send_ready.* = try SendReady.init(hdr, body, true, self.config.connection_write_timeout, self.allocator);
+        const sent_completion = try self.allocator.create(SentCompletion);
+        defer self.allocator.destroy(sent_completion);
+        sent_completion.* = .{};
+        send_ready.* = try SendReady.init(hdr, body, sent_completion, self.allocator);
 
         try self.waitEnqueue(send_ready, self.config.connection_write_timeout);
 
@@ -199,7 +209,7 @@ pub const Session = struct {
 
     pub fn send(self: *Session, hdr: []u8, body: ?[]u8) Error!void {
         const send_ready = try self.allocator.create(SendReady);
-        send_ready.* = try SendReady.init(hdr, body, false, self.config.connection_write_timeout, self.allocator);
+        send_ready.* = try SendReady.init(hdr, body, null, self.allocator);
 
         try self.waitEnqueue(send_ready, self.config.connection_write_timeout);
     }
@@ -234,24 +244,16 @@ pub const Session = struct {
 
             // Check if the session is shutting down
             if (self.shutdown_notification.isSet()) {
-                send_ready.setError(Error.SessionShutdown);
-                if (send_ready.sent_completion) |*sent_completion| {
-                    sent_completion.set();
-                }
-                if (send_ready.free_completion) |*free_completion| {
-                    free_completion.timedWait(send_ready.timeout_ns) catch {};
+                if (send_ready.sent_completion.load(.acquire)) |sent_completion| {
+                    sent_completion.setError(Error.SessionShutdown);
                 }
                 return;
             }
 
             _ = self.conn.write(send_ready.hdr) catch |err| {
                 std.debug.print("sendLoop: write error: {}\n", .{err});
-                send_ready.setError(err);
-                if (send_ready.sent_completion) |*sent_completion| {
-                    sent_completion.set();
-                }
-                if (send_ready.free_completion) |*free_completion| {
-                    free_completion.timedWait(send_ready.timeout_ns) catch {};
+                if (send_ready.sent_completion.load(.acquire)) |sent_completion| {
+                    sent_completion.setError(err);
                 }
                 return err;
             };
@@ -259,22 +261,15 @@ pub const Session = struct {
             if (send_ready.body) |body| {
                 _ = self.conn.write(body) catch |err| {
                     std.debug.print("sendLoop: write error: {}\n", .{err});
-                    send_ready.setError(err);
-                    if (send_ready.sent_completion) |*sent_completion| {
-                        sent_completion.set();
-                    }
-                    if (send_ready.free_completion) |*free_completion| {
-                        free_completion.timedWait(send_ready.timeout_ns) catch {};
+                    if (send_ready.sent_completion.load(.acquire)) |sent_completion| {
+                        sent_completion.setError(err);
                     }
                     return err;
                 };
             }
 
-            if (send_ready.sent_completion) |*sent_completion| {
-                sent_completion.set();
-            }
-            if (send_ready.free_completion) |*free_completion| {
-                free_completion.timedWait(send_ready.timeout_ns) catch {};
+            if (send_ready.sent_completion.load(.acquire)) |sent_completion| {
+                sent_completion.setDone();
             }
         }
     }
@@ -322,8 +317,9 @@ pub const Session = struct {
     }
 
     fn waitSent(self: *Session, send_ready: *SendReady, timeout_ns: u64) !void {
-        send_ready.sent_completion.?.timedWait(timeout_ns) catch {
-            send_ready.free_completion.?.set();
+        send_ready.sent_completion.load(.acquire).?.done.timedWait(timeout_ns) catch {
+            send_ready.sent_completion.store(null, .release);
+
             if (self.shutdown_notification.isSet()) {
                 return Error.SessionShutdown;
             }
@@ -331,16 +327,12 @@ pub const Session = struct {
         };
 
         if (self.shutdown_notification.isSet()) {
-            send_ready.free_completion.?.set();
             return Error.SessionShutdown;
         }
 
-        if (send_ready.getErr()) |err| {
-            send_ready.free_completion.?.set();
+        if (send_ready.sent_completion.load(.acquire).?.getErr()) |err| {
             return err;
         }
-
-        send_ready.free_completion.?.set();
     }
 };
 
