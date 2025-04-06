@@ -74,7 +74,7 @@ pub const Stream = struct {
 
     allocator: std.mem.Allocator,
 
-    pub fn init(s: *session.Session, id: u32, state: StreamState, stream: *Stream, alloc: std.mem.Allocator) !void {
+    pub fn init(stream: *Stream, s: *session.Session, id: u32, state: StreamState, alloc: std.mem.Allocator) !void {
         const control_hdr = try alloc.alloc(u8, frame.Header.SIZE);
         @memset(control_hdr, 0);
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const frame = @import("frame.zig");
 const Stream = @import("stream.zig").Stream;
 const conn = @import("conn.zig");
 const AnyConn = conn.AnyConn;
@@ -7,7 +8,7 @@ const Config = @import("Config.zig");
 const testing = std.testing;
 const ThreadPool = std.Thread.Pool;
 
-pub const Error = error{ SessionShutdown, ConnectionWriteTimeout, OutOfMemory };
+pub const Error = error{ SessionShutdown, ConnectionWriteTimeout, OutOfMemory, RemoteGoAway, StreamsExhausted, DuplicateStream };
 pub const SendQueue = std.SinglyLinkedList(*SendReady);
 
 const SentCompletion = struct {
@@ -35,7 +36,6 @@ const SentCompletion = struct {
 pub const SendReady = struct {
     hdr: []u8,
     body: ?[]u8 = null,
-    rwlock: std.Thread.RwLock = .{},
     sent_completion: ?*SentCompletion = null,
     allocator: Allocator,
 
@@ -138,7 +138,7 @@ pub const Session = struct {
         done: bool = false,
     } = .{},
 
-    shutdown_notification: std.Thread.ResetEvent = .{},
+    shutdown_completion: std.Thread.ResetEvent = .{},
 
     allocator: Allocator,
 
@@ -173,11 +173,9 @@ pub const Session = struct {
         self.send_queue_sync.mutex.lock();
         while (self.send_queue.popFirst()) |node| {
             const send_ready = node.data;
-            send_ready.rwlock.lock();
             if (send_ready.sent_completion) |sent_completion| {
                 self.allocator.destroy(sent_completion);
             }
-            send_ready.rwlock.unlock();
             send_ready.deinit();
             self.allocator.destroy(send_ready);
             self.allocator.destroy(node);
@@ -189,7 +187,6 @@ pub const Session = struct {
         const start_time = std.time.nanoTimestamp();
         const send_ready = try self.allocator.create(SendReady);
         const sent_completion = try self.allocator.create(SentCompletion);
-        defer self.allocator.destroy(sent_completion);
         sent_completion.* = .{};
         send_ready.* = try SendReady.init(hdr, body, sent_completion, self.allocator);
 
@@ -199,7 +196,7 @@ pub const Session = struct {
         if (self.config.connection_write_timeout <= elapsed_time) {
             return error.ConnectionWriteTimeout;
         }
-        try self.waitSent(send_ready, self.config.connection_write_timeout - @as(u64, @intCast(elapsed_time)));
+        try self.waitSent(sent_completion, self.config.connection_write_timeout - @as(u64, @intCast(elapsed_time)));
     }
 
     pub fn send(self: *Session, hdr: []u8, body: ?[]u8) Error!void {
@@ -216,12 +213,12 @@ pub const Session = struct {
     }
 
     pub fn sendLoop(self: *Session) !void {
-        while (!self.shutdown_notification.isSet()) {
+        while (!self.shutdown_completion.isSet()) {
             self.send_queue_sync.mutex.lock();
             while (self.send_queue_size == 0) {
                 // Wait for a notification that the queue is not empty
                 self.send_queue_sync.not_empty_cond.wait(&self.send_queue_sync.mutex);
-                if (self.shutdown_notification.isSet()) {
+                if (self.shutdown_completion.isSet()) {
                     self.send_queue_sync.mutex.unlock();
                     return;
                 }
@@ -238,54 +235,212 @@ pub const Session = struct {
             self.send_queue_sync.mutex.unlock();
 
             // Check if the session is shutting down
-            if (self.shutdown_notification.isSet()) {
-                send_ready.rwlock.lockShared();
+            if (self.shutdown_completion.isSet()) {
                 if (send_ready.sent_completion) |sent_completion| {
-                    sent_completion.setError(Error.SessionShutdown);
-                    sent_completion.done.set();
+                    if (sent_completion.done.isSet()) {
+                        self.allocator.destroy(sent_completion);
+                    } else {
+                        sent_completion.setError(Error.SessionShutdown);
+                        sent_completion.done.set();
+                    }
                 }
-                send_ready.rwlock.unlockShared();
                 return;
             }
 
             _ = self.conn.write(send_ready.hdr) catch |err| {
                 std.debug.print("sendLoop: write error: {}\n", .{err});
-                send_ready.rwlock.lockShared();
                 if (send_ready.sent_completion) |sent_completion| {
-                    sent_completion.setError(err);
-                    sent_completion.done.set();
+                    if (sent_completion.done.isSet()) {
+                        self.allocator.destroy(sent_completion);
+                    } else {
+                        sent_completion.setError(err);
+                        sent_completion.done.set();
+                    }
                 }
-                send_ready.rwlock.unlockShared();
                 return err;
             };
 
             if (send_ready.body) |body| {
                 _ = self.conn.write(body) catch |err| {
                     std.debug.print("sendLoop: write error: {}\n", .{err});
-                    send_ready.rwlock.lockShared();
                     if (send_ready.sent_completion) |sent_completion| {
-                        sent_completion.setError(err);
-                        sent_completion.done.set();
+                        if (sent_completion.done.isSet()) {
+                            self.allocator.destroy(sent_completion);
+                        } else {
+                            sent_completion.setError(err);
+                            sent_completion.done.set();
+                        }
                     }
-                    send_ready.rwlock.unlockShared();
                     return err;
                 };
             }
 
-            send_ready.rwlock.lockShared();
             if (send_ready.sent_completion) |sent_completion| {
-                sent_completion.done.set();
+                if (sent_completion.done.isSet()) {
+                    self.allocator.destroy(sent_completion);
+                } else {
+                    sent_completion.done.set();
+                }
             }
-            send_ready.rwlock.unlockShared();
         }
     }
 
+    pub fn streamsNum(self: *Session) usize {
+        self.stream_mutex.lock();
+        defer self.stream_mutex.unlock();
+        return self.streams.count();
+    }
+
+    pub fn openStream(self: *Session) !*Stream {
+        if (self.isClosed()) {
+            return Error.SessionShutdown;
+        }
+        if (self.remote_go_away.load(.acquire) == 1) {
+            return Error.RemoteGoAway;
+        }
+
+        // Block if we have too many inflight SYNs
+        self.syn_semaphore.wait();
+        errdefer self.syn_semaphore.post();
+        if (self.isClosed()) {
+            return Error.SessionShutdown;
+        }
+
+        const id = try self.getNextStreamId();
+
+        const stream = try self.allocator.create(Stream);
+        try Stream.init(stream, self, id, .init, self.allocator);
+        errdefer stream.deinit();
+
+        self.stream_mutex.lock();
+        try self.streams.put(id, stream);
+        try self.inflight.put(id, {});
+        self.stream_mutex.unlock();
+
+        // Setup timeout if needed
+        if (self.config.stream_open_timeout > 0) {
+            try self.scheduler.spawn(setOpenTimeoutInThread, .{ self, stream });
+        }
+
+        // Send the window update to create the stream
+        stream.sendWindowUpdate() catch |err| {
+            _ = self.streams.remove(id);
+            _ = self.inflight.remove(id);
+            self.syn_semaphore.post();
+            return err;
+        };
+
+        return stream;
+    }
+
+    fn setOpenTimeoutInThread(self: *Session, stream: *Stream) void {
+        self.setOpenTimeout(stream) catch |err| {
+            std.debug.print("setOpenTimeout error: {}\n", .{err});
+        };
+    }
+
+    fn setOpenTimeout(self: *Session, _: *Stream) !void {
+        const start_time = std.time.nanoTimestamp();
+        const timeout_ns = self.config.stream_open_timeout;
+
+        while (true) {
+            // Check if the stream is established
+            // if (stream.isEstablished()) {
+            //     return;
+            // }
+
+            // Check if the session is shutdown
+            if (self.shutdown_completion.isSet()) {
+                return;
+            }
+
+            // Check if timeout is reached
+            const elapsed = std.time.nanoTimestamp() - start_time;
+            if (elapsed >= timeout_ns) {
+                std.debug.print("[ERR] yamux: aborted stream open: timeout\n", .{});
+                self.close();
+                return;
+            }
+
+            // Sleep for a short time before checking again
+            const remaining = @as(u64, @intCast(@max(0, timeout_ns - elapsed)));
+            const sleep_time = @min(remaining, 10 * std.time.ns_per_ms);
+            std.time.sleep(sleep_time);
+        }
+    }
+
+    pub fn isClosed(self: *Session) bool {
+        return self.shutdown_completion.isSet();
+    }
+
     pub fn close(self: *Session) void {
-        self.shutdown_notification.set();
+        self.shutdown_completion.set();
         self.send_queue_sync.mutex.lock();
         self.send_queue_sync.not_empty_cond.broadcast();
         self.send_queue_sync.not_full_cond.broadcast();
         self.send_queue_sync.mutex.unlock();
+    }
+
+    pub fn createInboundStream(self: *Session, id: u32) !void {
+        // Reject immediately if we are doing a go away
+        if (self.local_go_away.load(.acquire) == 1) {
+            const hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
+            try frame.Header.init(frame.FrameType.WINDOW_UPDATE, frame.FrameFlags.RST, id, 0).encode(hdr);
+            return self.send(hdr, null);
+        }
+
+        const stream = try self.allocator.create(Stream);
+        try Stream.init(stream, self, id, .syn_received, self.allocator);
+        errdefer stream.deinit();
+
+        self.stream_mutex.lock();
+        defer self.stream_mutex.unlock();
+
+        // Check if the stream is already established
+        if (self.streams.contains(id)) {
+            std.debug.print("createInboundStream: stream already exists\n", .{});
+            return Error.DuplicateStream;
+        }
+        // return stream;
+    }
+
+    pub fn closeStream(self: *Session, id: u32) void {
+        self.stream_mutex.lock();
+        if (self.inflight.contains(id)) {
+            self.syn_semaphore.post();
+            _ = self.inflight.remove(id);
+        }
+        _ = self.streams.remove(id);
+        self.stream_mutex.unlock();
+    }
+
+    pub fn establishStream(self: *Session, id: u32) void {
+        self.stream_mutex.lock();
+        if (self.inflight.contains(id)) {
+            _ = self.inflight.remove(id);
+        } else {
+            std.debug.print("establishStream: stream not found\n", .{});
+        }
+        self.syn_semaphore.post();
+        self.stream_mutex.unlock();
+    }
+
+    fn getNextStreamId(self: *Session) !u32 {
+        while (true) {
+            const id = self.next_stream_id.load(.acquire);
+            if (id >= std.math.maxInt(u32) - 1) {
+                return Error.StreamsExhausted;
+            }
+
+            if (self.next_stream_id.cmpxchgWeak(id, id + 2, .acq_rel, .acquire) == id) {
+                return id;
+            }
+        }
+    }
+
+    fn goAway(self: *Session, reason: u32, hdr: []u8) !void {
+        self.local_go_away.swap(1, .release);
+        try frame.Header.init(frame.FrameType.GO_AWAY, 0, 0, reason).encode(hdr);
     }
 
     fn waitEnqueue(self: *Session, send_ready: *SendReady, timeout_ns: u64) Error!void {
@@ -293,22 +448,31 @@ pub const Session = struct {
         while (self.send_queue_size >= self.send_queue_capacity) {
             self.send_queue_sync.not_full_cond.timedWait(&self.send_queue_sync.mutex, timeout_ns) catch {
                 self.send_queue_sync.mutex.unlock();
+                if (send_ready.sent_completion) |sent_completion| {
+                    self.allocator.destroy(sent_completion);
+                }
                 send_ready.deinit();
                 self.allocator.destroy(send_ready);
-                if (self.shutdown_notification.isSet()) {
+                if (self.shutdown_completion.isSet()) {
                     return Error.SessionShutdown;
                 }
                 return Error.ConnectionWriteTimeout;
             };
-            if (self.shutdown_notification.isSet()) {
+            if (self.shutdown_completion.isSet()) {
                 self.send_queue_sync.mutex.unlock();
+                if (send_ready.sent_completion) |sent_completion| {
+                    self.allocator.destroy(sent_completion);
+                }
                 send_ready.deinit();
                 self.allocator.destroy(send_ready);
                 return Error.SessionShutdown;
             }
         }
-        if (self.shutdown_notification.isSet()) {
+        if (self.shutdown_completion.isSet()) {
             self.send_queue_sync.mutex.unlock();
+            if (send_ready.sent_completion) |sent_completion| {
+                self.allocator.destroy(sent_completion);
+            }
             send_ready.deinit();
             self.allocator.destroy(send_ready);
             return Error.SessionShutdown;
@@ -322,30 +486,28 @@ pub const Session = struct {
         self.send_queue_sync.mutex.unlock();
     }
 
-    fn waitSent(self: *Session, send_ready: *SendReady, timeout_ns: u64) !void {
-        send_ready.rwlock.lockShared();
-        send_ready.sent_completion.?.done.timedWait(timeout_ns) catch {
-            send_ready.rwlock.unlockShared();
-            send_ready.rwlock.lock();
-            send_ready.sent_completion = null;
-            send_ready.rwlock.unlock();
+    fn waitSent(self: *Session, sent_completion: *SentCompletion, timeout_ns: u64) !void {
+        sent_completion.done.timedWait(timeout_ns) catch {
+            // If the wait times out, we will not destroy the sent_completion,
+            // as it may be used by the send loop.
+            sent_completion.done.set();
 
-            if (self.shutdown_notification.isSet()) {
+            if (self.shutdown_completion.isSet()) {
                 return Error.SessionShutdown;
             }
             return Error.ConnectionWriteTimeout;
         };
-        send_ready.rwlock.unlockShared();
 
-        if (self.shutdown_notification.isSet()) {
+        if (self.shutdown_completion.isSet()) {
+            self.allocator.destroy(sent_completion);
             return Error.SessionShutdown;
         }
 
-        send_ready.rwlock.lockShared();
-        if (send_ready.sent_completion.?.getErr()) |err| {
+        if (sent_completion.getErr()) |err| {
+            self.allocator.destroy(sent_completion);
             return err;
         }
-        send_ready.rwlock.unlockShared();
+        self.allocator.destroy(sent_completion);
     }
 };
 
