@@ -75,7 +75,7 @@ pub const Header = struct {
 
     /// Encode header to wire format
     pub fn encode(self: Header, buffer: []u8) !void {
-        if (buffer.len < SIZE) return error.BufferTooSmall;
+        if (buffer.len < SIZE) return Error.BufferTooSmall;
 
         buffer[0] = self.version;
         buffer[1] = @intFromEnum(self.frame_type);
@@ -86,10 +86,10 @@ pub const Header = struct {
 
     /// Decode header from wire format
     pub fn decode(buffer: []const u8) !Header {
-        if (buffer.len < SIZE) return error.BufferTooSmall;
+        if (buffer.len < SIZE) return Error.BufferTooSmall;
 
         if (buffer[0] != PROTOCOL_VERSION) {
-            return error.InvalidProtocolVersion;
+            return Error.InvalidProtocolVersion;
         }
 
         return .{
@@ -125,7 +125,7 @@ pub const Header = struct {
 };
 
 /// Errors that can occur during frame operations
-pub const FrameError = error{
+pub const Error = error{
     BufferTooSmall,
     InvalidProtocolVersion,
     InvalidFrameType,

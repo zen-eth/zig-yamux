@@ -7,8 +7,9 @@ const AnyConn = conn.AnyConn;
 const Config = @import("Config.zig");
 const testing = std.testing;
 const ThreadPool = std.Thread.Pool;
+const BlockingQueue = @import("concurrency/blocking_queue.zig").BlockingQueue;
 
-pub const Error = error{ SessionShutdown, ConnectionWriteTimeout, OutOfMemory, RemoteGoAway, StreamsExhausted, DuplicateStream };
+pub const Error = error{ SessionShutdown, ConnectionWriteTimeout, OutOfMemory, RemoteGoAway, StreamsExhausted, DuplicateStream } || frame.Error;
 pub const SendQueue = std.SinglyLinkedList(*SendReady);
 
 const SentCompletion = struct {
@@ -109,7 +110,7 @@ pub const Session = struct {
     syn_semaphore: std.Thread.Semaphore = .{},
 
     // accept_queue is used to pass ready streams to the client
-    accept_queue: std.fifo.LinearFifo(*Stream, .Dynamic),
+    accept_queue: *BlockingQueue(*Stream),
 
     // send_queue is used to mark a stream as ready to send,
     // or to send a header out directly.
@@ -150,7 +151,7 @@ pub const Session = struct {
             .conn = any_conn,
             .buf_read = any_conn.reader(),
             .allocator = allocator,
-            .accept_queue = std.fifo.LinearFifo(*Stream, .Dynamic).init(allocator),
+            .accept_queue = try BlockingQueue(*Stream).create(allocator, config.accept_backlog),
             .send_queue = .{},
             .pings = std.AutoHashMap(u32, std.Thread.ResetEvent).init(allocator),
             .streams = std.AutoHashMap(u32, *Stream).init(allocator),
@@ -169,7 +170,7 @@ pub const Session = struct {
         self.streams.deinit();
         self.inflight.deinit();
         self.pings.deinit();
-        self.accept_queue.deinit();
+        self.accept_queue.destroy(self.allocator);
         self.send_queue_sync.mutex.lock();
         while (self.send_queue.popFirst()) |node| {
             const send_ready = node.data;
@@ -385,6 +386,7 @@ pub const Session = struct {
         // Reject immediately if we are doing a go away
         if (self.local_go_away.load(.acquire) == 1) {
             const hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
+            defer self.allocator.free(hdr);
             try frame.Header.init(frame.FrameType.WINDOW_UPDATE, frame.FrameFlags.RST, id, 0).encode(hdr);
             return self.send(hdr, null);
         }
@@ -399,9 +401,31 @@ pub const Session = struct {
         // Check if the stream is already established
         if (self.streams.contains(id)) {
             std.debug.print("createInboundStream: stream already exists\n", .{});
+            const hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
+            defer self.allocator.free(hdr);
+            self.goAway(@intFromEnum(frame.GoAwayCode.PROTOCOL_ERROR), hdr) catch |err| {
+                std.debug.print("createInboundStream: goAway error: {}\n", .{err});
+            };
+            self.send(hdr, null) catch |err| {
+                std.debug.print("createInboundStream: send error: {}\n", .{err});
+            };
             return Error.DuplicateStream;
         }
-        // return stream;
+
+        try self.streams.put(id, stream);
+
+        if (self.accept_queue.push(stream, .{ .instant = {} }) == 0) {
+            std.debug.print("createInboundStream: accept_queue push failed since queue is full\n", .{});
+            _ = self.streams.remove(id);
+            const hdr = try self.allocator.alloc(u8, frame.Header.SIZE);
+            defer self.allocator.free(hdr);
+            frame.Header.init(frame.FrameType.WINDOW_UPDATE, frame.FrameFlags.RST, id, 0).encode(hdr) catch |err| {
+                std.debug.print("createInboundStream: encode error: {}\n", .{err});
+            };
+            self.send(hdr, null) catch |err| {
+                std.debug.print("createInboundStream: send error: {}\n", .{err});
+            };
+        }
     }
 
     pub fn closeStream(self: *Session, id: u32) void {
@@ -426,7 +450,7 @@ pub const Session = struct {
     }
 
     fn getNextStreamId(self: *Session) !u32 {
-        while (true) {
+        while (!self.shutdown_completion.isSet()) {
             const id = self.next_stream_id.load(.acquire);
             if (id >= std.math.maxInt(u32) - 1) {
                 return Error.StreamsExhausted;
@@ -436,10 +460,12 @@ pub const Session = struct {
                 return id;
             }
         }
+
+        return Error.SessionShutdown;
     }
 
     fn goAway(self: *Session, reason: u32, hdr: []u8) !void {
-        self.local_go_away.swap(1, .release);
+        _ = self.local_go_away.swap(1, .acq_rel);
         try frame.Header.init(frame.FrameType.GO_AWAY, 0, 0, reason).encode(hdr);
     }
 
